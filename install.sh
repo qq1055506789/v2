@@ -60,11 +60,14 @@ get_user_input() {
 install_dependencies() {
     log "安装依赖"
     apt update -y && apt upgrade -y || error "APT 更新失败"
-    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate || error "依赖安装失败"
+    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate net-tools || error "依赖安装失败"
     mkdir -p $VENV_DIR
-    python3 -m venv $VENV_DIR
+    python3 -m venv $VENV_DIR || error "虚拟环境创建失败"
     source $VENV_DIR/bin/activate
-    pip install flask flask-login flask-limiter pyotp bcrypt redis || error "Python 依赖安装失败"
+    pip install flask flask-login flask-limiter pyotp bcrypt redis || {
+        deactivate
+        error "Python 依赖安装失败"
+    }
     deactivate
 }
 
@@ -235,7 +238,7 @@ create_website() {
 get_ssl_certificate() {
     log "获取 SSL 证书"
     systemctl stop nginx
-    certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOMAIN" || error "证书获取失败"
+    certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOMAIN" --non-interactive || error "证书获取失败"
     [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] || error "证书文件未生成"
     systemctl start nginx
 }
@@ -250,7 +253,7 @@ $TRAFFIC_LOG /var/log/xray/*.log /var/log/v2ray/*.log {
     compress
     missingok
     notifempty
-    create 0644 nobody nobody
+    create 0644 www-data www-data
 }
 EOF
 }
@@ -258,9 +261,13 @@ EOF
 # 配置防火墙
 configure_firewall() {
     log "配置防火墙"
-    ufw allow 80
-    ufw allow 443
-    ufw status
+    if command -v ufw >/dev/null; then
+        ufw allow 80
+        ufw allow 443
+        ufw status
+    else
+        log "未安装 ufw，请手动开放 80 和 443 端口"
+    fi
 }
 
 # 创建流量监控脚本
@@ -272,7 +279,7 @@ CONFIG_DIR="$CONFIG_DIR"
 USER_CONFIG="\$CONFIG_DIR/users.json"
 TRAFFIC_LOG="\$CONFIG_DIR/traffic.log"
 API_PORT=$API_PORT
-python3 - << 'PYTHON'
+$VENV_DIR/bin/python - << 'PYTHON'
 import asyncio
 import aiohttp
 import json
@@ -433,7 +440,8 @@ update_links() {
     while read -r user; do
         local uuid=\$(echo "\$user" | jq -r '.id')
         local email=\$(echo "\$user" | jq -r '.email')
-        VMESS_JSON="{\"v\": \"2\", \"ps\": \"VMess_WS_${DOMAIN}_\${email}\", \"add\": \"$DOMAIN\", \"port\": \"443\", \"id\": \"\$uuid\", \"aid\": \"0\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$DOMAIN\", \"path\": \"$WEBSOCKET_PATH\", \"tls\": \"tls\"}"
+        VMESS_JSO
+N="{\"v\": \"2\", \"ps\": \"VMess_WS_${DOMAIN}_\${email}\", \"add\": \"$DOMAIN\", \"port\": \"443\", \"id\": \"\$uuid\", \"aid\": \"0\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$DOMAIN\", \"path\": \"$WEBSOCKET_PATH\", \"tls\": \"tls\"}"
         echo "\${email} VMess: vmess://\$(echo -n \$VMESS_JSON | base64 -w 0)" >> \$LINKS_FILE
         VLESS_LINK="vless://\$uuid@$DOMAIN:443?security=reality&encryption=none&pbk=\$(/usr/local/bin/xray-core x25519 | grep Public | awk '{print \$3}')&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.microsoft.com&remark=VLESS_Reality_${DOMAIN}_\${email}"
         echo "\${email} VLESS Reality: \$VLESS_LINK" >> \$LINKS_FILE
@@ -456,6 +464,8 @@ EOF
 create_web_panel() {
     log "创建 Web 面板"
     mkdir -p $WEB_PANEL_DIR/templates $WEB_PANEL_DIR/static
+    # 确保虚拟环境 Python 可执行
+    [[ -f "$VENV_DIR/bin/python" ]] || error "虚拟环境 Python 未找到"
     cat > $WEB_PANEL_DIR/app.py << EOF
 from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
@@ -467,7 +477,7 @@ app.secret_key = os.urandom(24)
 app.config['PERMANENT_SESSION_LIFETIME'] = 3600
 login_manager = LoginManager(app)
 limiter = Limiter(app, key_func=get_remote_address, default_limits=["5 per minute"])
-logging.basicConfig(filename='/var/log/v2ray/web.log', level=logging.INFO)
+logging.basicConfig(filename='/var/log/v2ray/panel.log', level=logging.INFO)
 CONFIG_DIR = "$CONFIG_DIR"
 USER_CONFIG = os.path.join(CONFIG_DIR, "users.json")
 LINKS_FILE = os.path.join(CONFIG_DIR, "links.txt")
@@ -700,6 +710,22 @@ th { background-color: #f2f2f2; }
 form { margin: 20px 0; }
 pre { background-color: #f9f9f9; padding: 10px; }
 EOF
+    # 设置权限
+    chown -R www-data:www-data $WEB_PANEL_DIR
+    chmod -R 755 $WEB_PANEL_DIR
+    # 检查端口占用
+    if netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null; then
+        log "端口 $WEB_PANEL_PORT 被占用，尝试释放"
+        fuser -k $WEB_PANEL_PORT/tcp
+    fi
+    # 测试 Flask 启动
+    log "测试 Flask 应用"
+    timeout 5 $VENV_DIR/bin/python $WEB_PANEL_DIR/app.py &>/var/log/v2ray/panel_test.log || {
+        log "Flask 启动测试失败，查看 /var/log/v2ray/panel_test.log"
+        cat /var/log/v2ray/panel_test.log
+        error "Flask 应用无法启动"
+    }
+    # 创建服务
     cat > /etc/systemd/system/v2ray-panel.service << EOF
 [Unit]
 Description=V2Ray Web Panel
@@ -708,14 +734,22 @@ After=network.target
 Type=simple
 ExecStart=$VENV_DIR/bin/python $WEB_PANEL_DIR/app.py
 Restart=on-failure
-User=nobody
+User=www-data
 WorkingDirectory=$WEB_PANEL_DIR
+StandardOutput=append:/var/log/v2ray/panel.log
+StandardError=append:/var/log/v2ray/panel.log
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable v2ray-panel
-    systemctl start v2ray-panel || error "Web 面板启动失败"
+    systemctl start v2ray-panel
+    sleep 2
+    systemctl is-active v2ray-panel >/dev/null || {
+        log "Web 面板服务启动失败，查看日志"
+        cat /var/log/v2ray/panel.log
+        error "Web 面板服务无法启动"
+    }
 }
 
 # 主函数
