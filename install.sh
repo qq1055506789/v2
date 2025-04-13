@@ -24,7 +24,7 @@ WEB_PANEL_PORT=8080
 WEB_ADMIN_USER="admin"
 WEB_ADMIN_PASS=$(openssl rand -base64 12)
 INSTALL_DIR="/root/v2ray-install"
-IP_WHITELIST="127.0.0.1"  # 可扩展为用户输入
+VENV_DIR="$WEB_PANEL_DIR/venv"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -59,16 +59,20 @@ get_user_input() {
 # 安装依赖
 install_dependencies() {
     log "安装依赖"
-    apt update -y && apt upgrade -y
-    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip apache2-utils redis logrotate
-    pip3 install flask flask-login flask-limiter pyotp bcrypt
+    apt update -y && apt upgrade -y || error "APT 更新失败"
+    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate || error "依赖安装失败"
+    mkdir -p $VENV_DIR
+    python3 -m venv $VENV_DIR
+    source $VENV_DIR/bin/activate
+    pip install flask flask-login flask-limiter pyotp bcrypt redis || error "Python 依赖安装失败"
+    deactivate
 }
 
 # 安装 Xray
 install_xray() {
     log "安装 Xray $XRAY_VERSION"
-    wget "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
-    unzip Xray-linux-64.zip -d /usr/local/bin/
+    wget "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" || error "Xray 下载失败"
+    unzip Xray-linux-64.zip -d /usr/local/bin/ || error "Xray 解压失败"
     mv /usr/local/bin/xray /usr/local/bin/xray-core
     chmod +x /usr/local/bin/xray-core
     rm Xray-linux-64.zip
@@ -172,7 +176,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable xray
-    systemctl start xray
+    systemctl start xray || error "Xray 服务启动失败"
 }
 
 # 配置 Nginx
@@ -193,6 +197,8 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
+    access_log /var/log/v2ray/nginx_access.log;
+    error_log /var/log/v2ray/nginx_error.log;
     root $WEBSITE_DIR;
     index index.html;
     location $WEBSOCKET_PATH {
@@ -205,14 +211,16 @@ server {
     location /panel {
         auth_basic "Restricted";
         auth_basic_user_file /etc/nginx/.htpasswd;
-        allow $IP_WHITELIST;
-        deny all;
         proxy_pass http://127.0.0.1:$WEB_PANEL_PORT;
         proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
     }
 }
 EOF
     ln -sf $NGINX_CONF /etc/nginx/sites-enabled/v2ray
+    mkdir -p /var/log/v2ray
+    nginx -t || error "Nginx 配置错误"
+    systemctl restart nginx || error "Nginx 重启失败"
 }
 
 # 创建伪装网站
@@ -228,6 +236,7 @@ get_ssl_certificate() {
     log "获取 SSL 证书"
     systemctl stop nginx
     certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOMAIN" || error "证书获取失败"
+    [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] || error "证书文件未生成"
     systemctl start nginx
 }
 
@@ -235,7 +244,7 @@ get_ssl_certificate() {
 configure_logrotate() {
     log "配置 logrotate"
     cat > /etc/logrotate.d/v2ray << EOF
-$TRAFFIC_LOG /var/log/xray/*.log {
+$TRAFFIC_LOG /var/log/xray/*.log /var/log/v2ray/*.log {
     daily
     rotate 7
     compress
@@ -244,6 +253,14 @@ $TRAFFIC_LOG /var/log/xray/*.log {
     create 0644 nobody nobody
 }
 EOF
+}
+
+# 配置防火墙
+configure_firewall() {
+    log "配置防火墙"
+    ufw allow 80
+    ufw allow 443
+    ufw status
 }
 
 # 创建流量监控脚本
@@ -439,15 +456,6 @@ EOF
 create_web_panel() {
     log "创建 Web 面板"
     mkdir -p $WEB_PANEL_DIR/templates $WEB_PANEL_DIR/static
-    cat > $WEB_PANEL_DIR/requirements.txt << EOF
-flask
-flask-login
-flask-limiter
-pyotp
-bcrypt
-redis
-EOF
-    pip3 install -r $WEB_PANEL_DIR/requirements.txt
     cat > $WEB_PANEL_DIR/app.py << EOF
 from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
@@ -456,7 +464,7 @@ from flask_limiter.util import get_remote_address
 import json, os, subprocess, uuid, datetime, pyotp, bcrypt, redis, logging
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
-app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # 会话超时 1 小时
+app.config['PERMANENT_SESSION_LIFETIME'] = 3600
 login_manager = LoginManager(app)
 limiter = Limiter(app, key_func=get_remote_address, default_limits=["5 per minute"])
 logging.basicConfig(filename='/var/log/v2ray/web.log', level=logging.INFO)
@@ -464,7 +472,6 @@ CONFIG_DIR = "$CONFIG_DIR"
 USER_CONFIG = os.path.join(CONFIG_DIR, "users.json")
 LINKS_FILE = os.path.join(CONFIG_DIR, "links.txt")
 API_PORT = $API_PORT
-IP_WHITELIST = {"$IP_WHITELIST"}
 r = redis.Redis(host='localhost', port=6379, db=0)
 users = {"$WEB_ADMIN_USER": bcrypt.hashpw("$WEB_ADMIN_PASS".encode(), bcrypt.gensalt()).decode()}
 class User(UserMixin):
@@ -481,7 +488,7 @@ def login():
         password = request.form['password']
         totp = request.form['totp']
         if username == "$WEB_ADMIN_USER" and bcrypt.checkpw(password.encode(), users[username].encode()):
-            if pyotp.TOTP('JBSWY3DPEHPK3PXP').verify(totp):  # 固定 TOTP 密钥，生产环境应动态生成
+            if pyotp.TOTP('JBSWY3DPEHPK3PXP').verify(totp):
                 login_user(User(username))
                 logging.info(f"用户 {username} 登录成功")
                 return redirect(url_for('index'))
@@ -699,7 +706,7 @@ Description=V2Ray Web Panel
 After=network.target
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 $WEB_PANEL_DIR/app.py
+ExecStart=$VENV_DIR/bin/python $WEB_PANEL_DIR/app.py
 Restart=on-failure
 User=nobody
 WorkingDirectory=$WEB_PANEL_DIR
@@ -708,7 +715,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable v2ray-panel
-    systemctl start v2ray-panel
+    systemctl start v2ray-panel || error "Web 面板启动失败"
 }
 
 # 主函数
@@ -725,6 +732,7 @@ main() {
     create_website
     get_ssl_certificate
     configure_logrotate
+    configure_firewall
     create_traffic_monitor
     create_health_check
     create_user_manager
