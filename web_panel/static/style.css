@@ -1,0 +1,6 @@
+body { font-family: Arial, sans-serif; margin: 20px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background-color: #f2f2f2; }
+form { margin: 20px 0; }
+pre { background-color: #f9f9f9; padding: 10px; }
