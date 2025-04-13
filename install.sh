@@ -61,6 +61,8 @@ install_dependencies() {
     log "安装依赖"
     apt update -y && apt upgrade -y || error "APT 更新失败"
     apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate net-tools ufw dnsutils || error "依赖安装失败"
+    systemctl start redis
+    systemctl enable redis
     mkdir -p $VENV_DIR
     python3 -m venv $VENV_DIR || error "虚拟环境创建失败"
     source $VENV_DIR/bin/activate
