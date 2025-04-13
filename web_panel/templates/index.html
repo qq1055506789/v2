@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>V2Ray 管理面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>V2Ray 管理面板</h1>
+    <p><a href="/logout">登出</a></p>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <h2>添加用户</h2>
+    <form method="post" action="/add_user">
+        <label>邮箱: <input type="email" name="email" required></label><br>
+        <label>流量限制: <input type="text" name="traffic_limit" value="100GB" required></label><br>
+        <label>到期日期: <input type="date" name="expire_date" required></label><br>
+        <label>自动续期: <input type="checkbox" name="auto_renew" checked></label><br>
+        <button type="submit">添加</button>
+    </form>
+    <h2>用户信息</h2>
+    <table>
+        <tr>
+            <th>邮箱</th>
+            <th>流量限制</th>
+            <th>到期日期</th>
+            <th>自动续期</th>
+            <th>上行流量 (GB)</th>
+            <th>下行流量 (GB)</th>
+            <th>总流量 (GB)</th>
+            <th>状态</th>
+            <th>操作</th>
+        </tr>
+        {% for user in users %}
+        <tr>
+            <td>{{ user.email }}</td>
+            <td>{{ user.traffic_limit }}</td>
+            <td>{{ user.expire_date }}</td>
+            <td>{{ '是' if user.auto_renew else '否' }}</td>
+            <td>{{ '%.2f' % (user.uplink / (1024**3)) }}</td>
+            <td>{{ '%.2f' % (user.downlink / (1024**3)) }}</td>
+            <td>{{ '%.2f' % (user.total / (1024**3)) }}</td>
+            <td>{{ '禁用' if user.disabled else '启用' }}</td>
+            <td>
+                <a href="/edit_user/{{ user.email }}">编辑</a>
+                <a href="/delete_user/{{ user.email }}">删除</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>V2RayN 链接</h2>
+    <pre>{{ links | join('') }}</pre>
+</body>
+</html>
