@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>登录</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>登录 V2Ray 面板</h1>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <form method="post">
+        <label>用户名: <input type="text" name="username" required></label><br>
+        <label>密码: <input type="password" name="password" required></label><br>
+        <label>TOTP: <input type="text" name="totp" required></label><br>
+        <button type="submit">登录</button>
+    </form>
+</body>
+</html>
