@@ -32,8 +32,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log() { echo -e "${GREEN}[INFO] $1${NC}"; }
-error() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
+log() { echo -e "${GREEN}[信息] $1${NC}"; }
+error() { echo -e "${RED}[错误] $1${NC}"; exit 1; }
 
 # 检查系统
 check_system() {
@@ -46,13 +46,13 @@ check_system() {
 
 # 获取用户输入
 get_user_input() {
-    read -p "请输入你的域名 (例如 example.com): " DOMAIN
+    read -p "请输入域名（例如 example.com）： " DOMAIN
     [[ -z "$DOMAIN" ]] && error "域名不能为空"
-    read -p "请输入 WebSocket 路径 (默认 /ray): " input_path
+    read -p "请输入 WebSocket 路径（默认 /ray）： " input_path
     [[ ! -z "$input_path" ]] && WEBSOCKET_PATH="$input_path"
-    read -p "请输入初始用户数量 (默认 1): " user_count
+    read -p "请输入初始用户数量（默认 1）： " user_count
     [[ -z "$user_count" || ! "$user_count" =~ ^[0-9]+$ ]] && user_count=1
-    read -p "请输入每个用户的总流量限制 (默认 100GB, 格式如 50GB): " input_traffic
+    read -p "请输入每个用户的总流量限制（默认 100GB，格式如 50GB）： " input_traffic
     [[ ! -z "$input_traffic" ]] && TRAFFIC_LIMIT="$input_traffic"
 }
 
@@ -60,7 +60,7 @@ get_user_input() {
 install_dependencies() {
     log "安装依赖"
     apt update -y && apt upgrade -y || error "APT 更新失败"
-    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate net-tools || error "依赖安装失败"
+    apt install -y curl wget unzip nginx certbot python3-certbot-nginx socat jq python3-pip python3-venv apache2-utils redis logrotate net-tools ufw || error "依赖安装失败"
     mkdir -p $VENV_DIR
     python3 -m venv $VENV_DIR || error "虚拟环境创建失败"
     source $VENV_DIR/bin/activate
@@ -75,7 +75,7 @@ install_dependencies() {
 install_xray() {
     log "安装 Xray $XRAY_VERSION"
     wget "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" || error "Xray 下载失败"
-    unzip Xray-linux-64.zip -d /usr/local/bin/ || error "Xray 解压失败"
+    unzip -o Xray-linux-64.zip -d /usr/local/bin/ || error "Xray 解压失败"
     mv /usr/local/bin/xray /usr/local/bin/xray-core
     chmod +x /usr/local/bin/xray-core
     rm Xray-linux-64.zip
@@ -222,7 +222,11 @@ server {
 EOF
     ln -sf $NGINX_CONF /etc/nginx/sites-enabled/v2ray
     mkdir -p /var/log/v2ray
-    nginx -t || error "Nginx 配置错误"
+    nginx -t || {
+        log "Nginx 配置测试失败，查看日志 /var/log/v2ray/nginx_error.log"
+        cat /var/log/v2ray/nginx_error.log
+        error "Nginx 配置错误"
+    }
     systemctl restart nginx || error "Nginx 重启失败"
 }
 
@@ -230,15 +234,35 @@ EOF
 create_website() {
     log "创建伪装网站"
     mkdir -p $WEBSITE_DIR
-    echo "<html><head><title>Welcome</title></head><body><h1>Welcome to $DOMAIN</h1></body></html>" > $WEBSITE_DIR/index.html
+    echo "<html><head><title>欢迎</title></head><body><h1>欢迎访问 $DOMAIN</h1></body></html>" > $WEBSITE_DIR/index.html
     chown -R www-data:www-data $WEBSITE_DIR
+}
+
+# 检查域名解析
+check_domain() {
+    log "检查域名解析"
+    if ! command -v dig >/dev/null; then
+        apt install -y dnsutils || log "无法安装 dig，请手动验证域名解析"
+    fi
+    if command -v dig >/dev/null; then
+        ip=$(dig +short $DOMAIN | tail -n 1)
+        local_ip=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+        if [[ -z "$ip" || "$ip" != "$local_ip" ]]; then
+            log "警告：域名 $DOMAIN 未正确解析到本机 IP ($local_ip)"
+            error "请确保域名解析正确"
+        fi
+    fi
 }
 
 # 获取 SSL 证书
 get_ssl_certificate() {
     log "获取 SSL 证书"
     systemctl stop nginx
-    certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOMAIN" --non-interactive || error "证书获取失败"
+    certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOMAIN" --non-interactive --force-renewal || {
+        log "证书申请失败，查看日志 /var/log/letsencrypt/letsencrypt.log"
+        cat /var/log/letsencrypt/letsencrypt.log
+        error "证书申请失败"
+    }
     [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] || error "证书文件未生成"
     systemctl start nginx
 }
@@ -261,6 +285,9 @@ EOF
 # 配置防火墙
 configure_firewall() {
     log "配置防火墙"
+    if ! command -v ufw >/dev/null; then
+        apt install -y ufw || log "无法安装 ufw，请手动开放端口"
+    fi
     if command -v ufw >/dev/null; then
         ufw allow 80
         ufw allow 443
@@ -297,7 +324,7 @@ async def check_user(email, limit_bytes, expire_date):
                 downlink = int((await resp.json())['value'])
             total = uplink + downlink
             with open("$TRAFFIC_LOG", "a") as f:
-                f.write(f"[{datetime.datetime.now()}] {email} - Uplink: {uplink}, Downlink: {downlink}, Total: {total}\n")
+                f.write(f"[{datetime.datetime.now()}] {email} - 上行: {uplink}, 下行: {downlink}, 总计: {total}\n")
             r.set(f"traffic:{email}", json.dumps({"uplink": uplink, "downlink": downlink, "total": total}))
             if total >= limit_bytes:
                 with open("$USER_CONFIG", "r") as f:
@@ -440,8 +467,7 @@ update_links() {
     while read -r user; do
         local uuid=\$(echo "\$user" | jq -r '.id')
         local email=\$(echo "\$user" | jq -r '.email')
-        VMESS_JSO
-N="{\"v\": \"2\", \"ps\": \"VMess_WS_${DOMAIN}_\${email}\", \"add\": \"$DOMAIN\", \"port\": \"443\", \"id\": \"\$uuid\", \"aid\": \"0\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$DOMAIN\", \"path\": \"$WEBSOCKET_PATH\", \"tls\": \"tls\"}"
+        VMESS_JSON="{\"v\": \"2\", \"ps\": \"VMess_WS_${DOMAIN}_\${email}\", \"add\": \"$DOMAIN\", \"port\": \"443\", \"id\": \"\$uuid\", \"aid\": \"0\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$DOMAIN\", \"path\": \"$WEBSOCKET_PATH\", \"tls\": \"tls\"}"
         echo "\${email} VMess: vmess://\$(echo -n \$VMESS_JSON | base64 -w 0)" >> \$LINKS_FILE
         VLESS_LINK="vless://\$uuid@$DOMAIN:443?security=reality&encryption=none&pbk=\$(/usr/local/bin/xray-core x25519 | grep Public | awk '{print \$3}')&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.microsoft.com&remark=VLESS_Reality_${DOMAIN}_\${email}"
         echo "\${email} VLESS Reality: \$VLESS_LINK" >> \$LINKS_FILE
@@ -464,7 +490,6 @@ EOF
 create_web_panel() {
     log "创建 Web 面板"
     mkdir -p $WEB_PANEL_DIR/templates $WEB_PANEL_DIR/static
-    # 确保虚拟环境 Python 可执行
     [[ -f "$VENV_DIR/bin/python" ]] || error "虚拟环境 Python 未找到"
     cat > $WEB_PANEL_DIR/app.py << EOF
 from flask import Flask, render_template, request, redirect, url_for, flash
@@ -638,7 +663,7 @@ EOF
     {% endfor %}
     <h2>添加用户</h2>
     <form method="post" action="/add_user">
-        <label>Email: <input type="email" name="email" required></label><br>
+        <label>邮箱: <input type="email" name="email" required></label><br>
         <label>流量限制: <input type="text" name="traffic_limit" value="$TRAFFIC_LIMIT" required></label><br>
         <label>到期日期: <input type="date" name="expire_date" required></label><br>
         <label>自动续期: <input type="checkbox" name="auto_renew" checked></label><br>
@@ -647,7 +672,7 @@ EOF
     <h2>用户信息</h2>
     <table>
         <tr>
-            <th>Email</th>
+            <th>邮箱</th>
             <th>流量限制</th>
             <th>到期日期</th>
             <th>自动续期</th>
@@ -692,7 +717,7 @@ EOF
         <p style="color: red;">{{ message }}</p>
     {% endfor %}
     <form method="post">
-        <label>Email: <input type="email" name="email" value="{{ user.email }}" required></label><br>
+        <label>邮箱: <input type="email" name="email" value="{{ user.email }}" required></label><br>
         <label>流量限制: <input type="text" name="traffic_limit" value="{{ user.traffic_limit }}" required></label><br>
         <label>到期日期: <input type="date" name="expire_date" value="{{ user.expire_date }}" required></label><br>
         <label>自动续期: <input type="checkbox" name="auto_renew" {{ 'checked' if user.auto_renew else '' }}></label><br>
@@ -710,22 +735,18 @@ th { background-color: #f2f2f2; }
 form { margin: 20px 0; }
 pre { background-color: #f9f9f9; padding: 10px; }
 EOF
-    # 设置权限
     chown -R www-data:www-data $WEB_PANEL_DIR
     chmod -R 755 $WEB_PANEL_DIR
-    # 检查端口占用
     if netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null; then
-        log "端口 $WEB_PANEL_PORT 被占用，尝试释放"
+        log "端口 $WEB_PANEL_PORT 被占用，释放端口"
         fuser -k $WEB_PANEL_PORT/tcp
     fi
-    # 测试 Flask 启动
     log "测试 Flask 应用"
     timeout 5 $VENV_DIR/bin/python $WEB_PANEL_DIR/app.py &>/var/log/v2ray/panel_test.log || {
         log "Flask 启动测试失败，查看 /var/log/v2ray/panel_test.log"
         cat /var/log/v2ray/panel_test.log
         error "Flask 应用无法启动"
     }
-    # 创建服务
     cat > /etc/systemd/system/v2ray-panel.service << EOF
 [Unit]
 Description=V2Ray Web Panel
@@ -746,9 +767,15 @@ EOF
     systemctl start v2ray-panel
     sleep 2
     systemctl is-active v2ray-panel >/dev/null || {
-        log "Web 面板服务启动失败，查看日志"
+        log "Web 面板服务启动失败，查看日志 /var/log/v2ray/panel.log"
         cat /var/log/v2ray/panel.log
         error "Web 面板服务无法启动"
+    }
+    # 验证端口监听
+    netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null || {
+        log "端口 $WEB_PANEL_PORT 未监听，检查服务状态"
+        systemctl status v2ray-panel
+        error "Web 面板未正确运行"
     }
 }
 
@@ -756,15 +783,16 @@ EOF
 main() {
     check_system
     get_user_input
+    check_domain
     mkdir -p $INSTALL_DIR
     install_dependencies
     install_xray
     generate_users
     configure_xray
     create_xray_service
+    get_ssl_certificate
     configure_nginx
     create_website
-    get_ssl_certificate
     configure_logrotate
     configure_firewall
     create_traffic_monitor
