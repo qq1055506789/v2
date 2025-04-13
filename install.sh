@@ -499,7 +499,7 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 app.config['PERMANENT_SESSION_LIFETIME'] = 3600
 login_manager = LoginManager(app)
-limiter = Limiter(get_remote_address, app=app, default_limits=["5 per minute"])
+limiter = Limiter(get_remote_address, app=app, storage_uri="redis://localhost:6379", default_limits=["5 per minute"])
 logging.basicConfig(filename='/var/log/v2ray/panel.log', level=logging.INFO)
 CONFIG_DIR = "$CONFIG_DIR"
 USER_CONFIG = os.path.join(CONFIG_DIR, "users.json")
@@ -740,11 +740,14 @@ EOF
         fuser -k $WEB_PANEL_PORT/tcp
     fi
     log "测试 Flask 应用"
-    timeout 5 $VENV_DIR/bin/python $WEB_PANEL_DIR/app.py &>/var/log/v2ray/panel_test.log || {
+    timeout 10 $VENV_DIR/bin/python $WEB_PANEL_DIR/app.py &>/var/log/v2ray/panel_test.log &
+    sleep 2
+    if ! netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null; then
         log "Flask 启动测试失败，查看 /var/log/v2ray/panel_test.log"
         cat /var/log/v2ray/panel_test.log
         error "Flask 应用无法启动"
-    }
+    fi
+    killall python3 2>/dev/null
     cat > /etc/systemd/system/v2ray-panel.service << EOF
 [Unit]
 Description=V2Ray Web Panel
@@ -767,6 +770,7 @@ EOF
     systemctl is-active v2ray-panel >/dev/null || {
         log "Web 面板服务启动失败，查看日志 /var/log/v2ray/panel.log"
         cat /var/log/v2ray/panel.log
+        systemctl status v2ray-panel
         error "Web 面板服务无法启动"
     }
     netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null || {
