@@ -484,6 +484,298 @@ EOF
     chmod +x $INSTALL_DIR/v2ray_user.sh
 }
 
+# 创建 Web 面板
+create_web_panel() {
+    log "创建 Web 面板"
+    mkdir -p $WEB_PANEL_DIR/templates $WEB_PANEL_DIR/static
+    [[ -f "$VENV_DIR/bin/python" ]] || error "虚拟环境 Python 未找到"
+    cat > $WEB_PANEL_DIR/app.py << EOF
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import json, os, subprocess, uuid, datetime, pyotp, bcrypt, redis, logging
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['PERMANENT_SESSION_LIFETIME'] = 3600
+login_manager = LoginManager(app)
+limiter = Limiter(get_remote_address, app=app, default_limits=["5 per minute"])
+logging.basicConfig(filename='/var/log/v2ray/panel.log', level=logging.INFO)
+CONFIG_DIR = "$CONFIG_DIR"
+USER_CONFIG = os.path.join(CONFIG_DIR, "users.json")
+LINKS_FILE = os.path.join(CONFIG_DIR, "links.txt")
+API_PORT = $API_PORT
+r = redis.Redis(host='localhost', port=6379, db=0)
+users = {"$WEB_ADMIN_USER": bcrypt.hashpw("$WEB_ADMIN_PASS".encode(), bcrypt.gensalt()).decode()}
+class User(UserMixin):
+    def __init__(self, id):
+        self.id = id
+@login_manager.user_loader
+def load_user(user_id):
+    return User(user_id) if user_id == "$WEB_ADMIN_USER" else None
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        totp = request.form['totp']
+        if username == "$WEB_ADMIN_USER" and bcrypt.checkpw(password.encode(), users[username].encode()):
+            if pyotp.TOTP('JBSWY3DPEHPK3PXP').verify(totp):
+                login_user(User(username))
+                logging.info(f"用户 {username} 登录成功")
+                return redirect(url_for('index'))
+            else:
+                flash("双因素认证失败")
+                logging.warning(f"用户 {username} TOTP 验证失败")
+        else:
+            flash("用户名或密码错误")
+            logging.warning(f"用户 {username} 登录失败")
+    return render_template('login.html')
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+@app.route('/')
+@login_required
+def index():
+    try:
+        with open(USER_CONFIG, 'r') as f:
+            users_data = json.load(f)
+        users = []
+        for user in users_data:
+            traffic = json.loads(r.get(f"traffic:{user['email']}") or b'{"uplink": 0, "downlink": 0, "total": 0}')
+            users.append({
+                'email': user['email'], 'traffic_limit': user['traffic_limit'], 'expire_date': user['expire_date'],
+                'auto_renew': user['auto_renew'], 'disabled': user.get('disabled', False),
+                'uplink': traffic['uplink'], 'downlink': traffic['downlink'], 'total': traffic['total']
+            })
+        links = open(LINKS_FILE).readlines() if os.path.exists(LINKS_FILE) else []
+        return render_template('index.html', users=users, links=links)
+    except Exception as e:
+        logging.error(f"加载面板失败: {str(e)}")
+        flash(f"加载失败: {str(e)}")
+        return render_template('index.html', users=[], links=[])
+@app.route('/add_user', methods=['POST'])
+@login_required
+def add_user():
+    try:
+        email = request.form['email']
+        with open(USER_CONFIG, 'r') as f:
+            users_data = json.load(f)
+        if any(u['email'] == email for u in users_data):
+            flash("用户已存在")
+            return redirect(url_for('index'))
+        new_user = {
+            "id": str(uuid.uuid4()), "alterId": 0, "email": email,
+            "traffic_limit": request.form['traffic_limit'], "expire_date": request.form['expire_date'],
+            "auto_renew": request.form.get('auto_renew') == 'on', "disabled": False
+        }
+        users_data.append(new_user)
+        with open(USER_CONFIG, 'w') as f:
+            json.dump(users_data, f, indent=2)
+        subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "add", email])
+        logging.info(f"添加用户 {email}")
+        flash("用户添加成功")
+    except Exception as e:
+        logging.error(f"添加用户失败: {str(e)}")
+        flash(f"添加用户失败: {str(e)}")
+    return redirect(url_for('index'))
+@app.route('/edit_user/<email>', methods=['GET', 'POST'])
+@login_required
+def edit_user(email):
+    try:
+        with open(USER_CONFIG, 'r') as f:
+            users_data = json.load(f)
+        user = next((u for u in users_data if u['email'] == email), None)
+        if not user:
+            flash("用户不存在")
+            return redirect(url_for('index'))
+        if request.method == 'POST':
+            user['email'] = request.form['email']
+            user['traffic_limit'] = request.form['traffic_limit']
+            user['expire_date'] = request.form['expire_date']
+            user['auto_renew'] = request.form.get('auto_renew') == 'on'
+            with open(USER_CONFIG, 'w') as f:
+                json.dump(users_data, f, indent=2)
+            subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "edit", email, "email", user['email']])
+            subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "edit", email, "traffic_limit", user['traffic_limit']])
+            subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "edit", email, "expire_date", user['expire_date']])
+            subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "edit", email, "auto_renew", str(user['auto_renew']).lower()])
+            logging.info(f"编辑用户 {email}")
+            flash("用户更新成功")
+            return redirect(url_for('index'))
+        return render_template('edit_user.html', user=user)
+    except Exception as e:
+        logging.error(f"编辑用户失败: {str(e)}")
+        flash(f"编辑用户失败: {str(e)}")
+        return redirect(url_for('index'))
+@app.route('/delete_user/<email>')
+@login_required
+def delete_user(email):
+    try:
+        subprocess.run(["$INSTALL_DIR/v2ray_user.sh", "delete", email])
+        logging.info(f"删除用户 {email}")
+        flash("用户删除成功")
+    except Exception as e:
+        logging.error(f"删除用户失败: {str(e)}")
+        flash(f"删除用户失败: {str(e)}")
+    return redirect(url_for('index'))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=$WEB_PANEL_PORT)
+EOF
+    cat > $WEB_PANEL_DIR/templates/login.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>登录</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>登录 V2Ray 面板</h1>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <form method="post">
+        <label>用户名: <input type="text" name="username" required></label><br>
+        <label>密码: <input type="password" name="password" required></label><br>
+        <label>TOTP: <input type="text" name="totp" required></label><br>
+        <button type="submit">登录</button>
+    </form>
+</body>
+</html>
+EOF
+    cat > $WEB_PANEL_DIR/templates/index.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>V2Ray 管理面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>V2Ray 管理面板</h1>
+    <p><a href="/logout">登出</a></p>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <h2>添加用户</h2>
+    <form method="post" action="/add_user">
+        <label>邮箱: <input type="email" name="email" required></label><br>
+        <label>流量限制: <input type="text" name="traffic_limit" value="$TRAFFIC_LIMIT" required></label><br>
+        <label>到期日期: <input type="date" name="expire_date" required></label><br>
+        <label>自动续期: <input type="checkbox" name="auto_renew" checked></label><br>
+        <button type="submit">添加</button>
+    </form>
+    <h2>用户信息</h2>
+    <table>
+        <tr>
+            <th>邮箱</th>
+            <th>流量限制</th>
+            <th>到期日期</th>
+            <th>自动续期</th>
+            <th>上行流量 (GB)</th>
+            <th>下行流量 (GB)</th>
+            <th>总流量 (GB)</th>
+            <th>状态</th>
+            <th>操作</th>
+        </tr>
+        {% for user in users %}
+        <tr>
+            <td>{{ user.email }}</td>
+            <td>{{ user.traffic_limit }}</td>
+            <td>{{ user.expire_date }}</td>
+            <td>{{ '是' if user.auto_renew else '否' }}</td>
+            <td>{{ '%.2f' % (user.uplink / (1024**3)) }}</td>
+            <td>{{ '%.2f' % (user.downlink / (1024**3)) }}</td>
+            <td>{{ '%.2f' % (user.total / (1024**3)) }}</td>
+            <td>{{ '禁用' if user.disabled else '启用' }}</td>
+            <td>
+                <a href="/edit_user/{{ user.email }}">编辑</a>
+                <a href="/delete_user/{{ user.email }}">删除</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    <h2>V2RayN 链接</h2>
+    <pre>{{ links | join('') }}</pre>
+</body>
+</html>
+EOF
+    cat > $WEB_PANEL_DIR/templates/edit_user.html << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>编辑用户</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>编辑用户</h1>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <form method="post">
+        <label>邮箱: <input type="email" name="email" value="{{ user.email }}" required></label><br>
+        <label>流量限制: <input type="text" name="traffic_limit" value="{{ user.traffic_limit }}" required></label><br>
+        <label>到期日期: <input type="date" name="expire_date" value="{{ user.expire_date }}" required></label><br>
+        <label>自动续期: <input type="checkbox" name="auto_renew" {{ 'checked' if user.auto_renew else '' }}></label><br>
+        <button type="submit">保存</button>
+    </form>
+    <p><a href="/">返回</a></p>
+</body>
+</html>
+EOF
+    cat > $WEB_PANEL_DIR/static/style.css << EOF
+body { font-family: Arial, sans-serif; margin: 20px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+th { background-color: #f2f2f2; }
+form { margin: 20px 0; }
+pre { background-color: #f9f9f9; padding: 10px; }
+EOF
+    chown -R www-data:www-data $WEB_PANEL_DIR
+    chmod -R 755 $WEB_PANEL_DIR
+    if netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null; then
+        log "端口 $WEB_PANEL_PORT 被占用，释放端口"
+        fuser -k $WEB_PANEL_PORT/tcp
+    fi
+    log "测试 Flask 应用"
+    timeout 5 $VENV_DIR/bin/python $WEB_PANEL_DIR/app.py &>/var/log/v2ray/panel_test.log || {
+        log "Flask 启动测试失败，查看 /var/log/v2ray/panel_test.log"
+        cat /var/log/v2ray/panel_test.log
+        error "Flask 应用无法启动"
+    }
+    cat > /etc/systemd/system/v2ray-panel.service << EOF
+[Unit]
+Description=V2Ray Web Panel
+After=network.target
+[Service]
+Type=simple
+ExecStart=$VENV_DIR/bin/python $WEB_PANEL_DIR/app.py
+Restart=on-failure
+User=www-data
+WorkingDirectory=$WEB_PANEL_DIR
+StandardOutput=append:/var/log/v2ray/panel.log
+StandardError=append:/var/log/v2ray/panel.log
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable v2ray-panel
+    systemctl start v2ray-panel
+    sleep 2
+    systemctl is-active v2ray-panel >/dev/null || {
+        log "Web 面板服务启动失败，查看日志 /var/log/v2ray/panel.log"
+        cat /var/log/v2ray/panel.log
+        error "Web 面板服务无法启动"
+    }
+    netstat -tuln | grep ":$WEB_PANEL_PORT " >/dev/null || {
+        log "端口 $WEB_PANEL_PORT 未监听，检查服务状态"
+        systemctl status v2ray-panel
+        error "Web 面板未正确运行"
+    }
+}
+
 # 主函数
 main() {
     check_system
