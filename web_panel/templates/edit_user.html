@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>编辑用户</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>编辑用户</h1>
+    {% for message in get_flashed_messages() %}
+        <p style="color: red;">{{ message }}</p>
+    {% endfor %}
+    <form method="post">
+        <label>邮箱: <input type="email" name="email" value="{{ user.email }}" required></label><br>
+        <label>流量限制: <input type="text" name="traffic_limit" value="{{ user.traffic_limit }}" required></label><br>
+        <label>到期日期: <input type="date" name="expire_date" value="{{ user.expire_date }}" required></label><br>
+        <label>自动续期: <input type="checkbox" name="auto_renew" {{ 'checked' if user.auto_renew else '' }}></label><br>
+        <button type="submit">保存</button>
+    </form>
+    <p><a href="/">返回</a></p>
+</body>
+</html>
